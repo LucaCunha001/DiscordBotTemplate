@@ -1,11 +1,13 @@
 import asyncio
 import datetime
 import json
+import random
 import re
 import discord
-from cmd_gps.classes import constantes, DropdownView, TicketView, CallCreatorView, CallControllerView, DropdownMenu
+from cmd_gps.classes import constantes, DropdownView, TicketView, CallCreatorView, CallControllerView, DropdownMenu, SorteioView, carregar_dados, salvar_dados
 from cpu import InfoCommands
 from discord import app_commands
+from discord.ext import tasks
 from embed_model import EmbedModelCommands
 
 class Parceria(app_commands.Group):
@@ -65,10 +67,11 @@ class client(discord.Client):
 		"""
 		Views eternas.
 		"""
-		self.add_view(DropdownView())
+		self.add_view(DropdownView(bot=self))
 		self.add_view(TicketView(bot=self))
-		self.add_view(CallCreatorView())
+		self.add_view(CallCreatorView(bot=self))
 		self.add_view(CallControllerView())
+		self.add_view(SorteioView())
 	
 	async def on_ready(self):
 		"""
@@ -100,6 +103,73 @@ class client(discord.Client):
 
 bot = client()
 tree = app_commands.CommandTree(bot)
+
+@tasks.loop(seconds=60)
+async def verificar_sorteios():
+	dados = carregar_dados()
+	agora = datetime.datetime.now()
+	atualizados = False
+
+	for msg_id, info in list(dados.items()):
+		fim = datetime.datetime.fromisoformat(info["fim"])
+		if agora >= fim:
+			canal = bot.get_channel(info["canal"])
+			if not canal:
+				continue
+			try:
+				mensagem = await canal.fetch_message(int(msg_id))
+			except discord.NotFound:
+				continue
+
+			participantes = info.get("participantes", [])
+			if participantes:
+				vencedor_id = random.choice(participantes)
+				vencedor = canal.guild.get_member(vencedor_id)
+				embed = mensagem.embeds[0]
+				embed.description = f"Parabéns, {vencedor.mention if vencedor else 'alguém'}! Contate <@{info['autor']}> para receber seu prêmio.\n\nEncerrou <t:{agora.timestamp()}:R>."
+				await mensagem.reply(content=vencedor.mention, embed=embed, view=None)
+			else:
+				await mensagem.reply(content="😢 O sorteio foi encerrado, mas ninguém participou.", view=None)
+
+			del dados[msg_id]
+			atualizados = True
+
+	if atualizados:
+		salvar_dados(dados)
+
+@tree.command(name="sorteios", description="Inicia um sorteio")
+async def sorteio(interaction: discord.Interaction, tempo_em_minutos: int, detalhes: str):
+	"""Inicia um sorteio que será encerrado automaticamente após um tempo."""
+	fim = datetime.datetime.now() + datetime.timedelta(minutes=tempo_em_minutos)
+	fim_str = fim.isoformat()
+
+	await interaction.response.send_message("Preparando sorteio...", ephemeral=True)
+	
+	embed = discord.Embed(
+		title="🎁 Sorteio iniciado!",
+		description=f"Encerra <t:{fim.timestamp()}:R>.\n\nClique no botão abaixo para participar!",
+		colour=interaction.user.colour
+	)
+
+	embed.add_field(name="Detalhes do sorteio:", value=detalhes)
+	embed.set_author(name=interaction.user.name, icon_url=interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url)
+	embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild.icon else None)
+	
+	anuncios = bot.get_channel(constantes.CANAIS.CANAL_ANUNCIOS)
+	dummy = await anuncios.send(embed=embed, view=SorteioView())
+
+	dados = carregar_dados()
+	dados[str(dummy.id)] = {
+		"canal": interaction.channel.id,
+		"autor": interaction.user.id,
+		"fim": fim_str,
+		"participantes": []
+	}
+	salvar_dados(dados)
+
+	await dummy.channel.send(content=constantes.CARGOS.CARGO_SORTEIOS)
+	await interaction.response.edit_message(f"Sorteio configurado! Termina emm <t:{fim.timestamp()}:R>")
+
 
 @tree.command(name="comandos", description="Veja quais comandos eu tenho")
 async def ver_comands(interaction: discord.Interaction):
@@ -234,6 +304,8 @@ async def on_voice_state_update(membro: discord.Member, antes: discord.VoiceStat
 async def on_message(mensagem: discord.Message):
 	if mensagem.author == bot.user:
 		return
+	if not mensagem.guild:
+		return
 	match_ = INVITE_REGEX.search(mensagem.content)
 	if match_:
 		invite_url = match_.group()
@@ -259,7 +331,7 @@ async def on_message(mensagem: discord.Message):
 	match_=URL_REGEX.search(mensagem.content)
 	if not match_ and mensagem.channel.id == constantes.CANAIS.CANAL_DIVULGACAO and not any(cg.id == constantes.CARGOS.CARGO_STAFF for cg in mensagem.author.roles):
 		await mensagem.delete()
-	emojis_proibidos = ["🍆", "🍒", "🍑", "🌸", "💦", "🔞", "👅", "🤤", "🍌", "💧", "👉", "👌", "🥵"]
+	emojis_proibidos = ["🍆", "🍒", "🍑", "🌸", "💦", "🔞", "👅", "🤤", "🍌", "💧", "👉👌", "🥵"]
 	everyone_role = mensagem.guild.default_role
 	canal_privado = not mensagem.channel.permissions_for(everyone_role).read_messages
 	if not canal_privado and any(emoji in mensagem.content for emoji in emojis_proibidos) and not any(cg.id == constantes.CARGOS.CARGO_STAFF for cg in mensagem.author.roles):
@@ -515,7 +587,7 @@ async def boost_message(interaction: discord.Interaction):
 		await boost(interaction.user)
 		await interaction.response.send_message("Mensagem de boost enviada com sucesso!", ephemeral=True)
 
-@tree.command(name="membros")
+@tree.command(name="membros", description="Veja a quantidade de membros do servidor.")
 async def membros(interaction: discord.Interaction):
 	embed = discord.Embed(
 		title="Membros",
@@ -541,7 +613,7 @@ async def membros(interaction: discord.Interaction):
 	embed.add_field(name="Ausente", value=f"`{idle}`")
 	embed.add_field(name="Offline", value=f"`{offline}`")
 	embed.add_field(name="Boosters", value=f"`{boosters}`")
-	embed.add_field(name="Já deram Boosts", value=f"`{ja_boosters}`")
+	embed.add_field(name="Já deram Boost", value=f"`{ja_boosters}`")
 
 	if interaction.guild.icon:
 		embed.set_thumbnail(url=interaction.guild.icon.url)
